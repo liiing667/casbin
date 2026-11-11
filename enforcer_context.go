@@ -422,28 +422,58 @@ func (e *ContextEnforcer) addPolicyWithoutNotifyCtx(ctx context.Context, sec str
 		return true, e.dispatcher.AddPolicies(sec, ptype, [][]string{rule})
 	}
 
-	hasPolicy, err := e.model.HasPolicy(sec, ptype, rule)
+	hasPolicy, err := e.model.HasPolicyEx(sec, ptype, rule)
 	if hasPolicy || err != nil {
 		return false, err
 	}
 
+	assertion, _ := e.model.GetAssertion(sec, ptype)
+	oldPolicy := assertion.Policy
+	oldPolicyMap := assertion.PolicyMap
+	oldPolicyVersion := assertion.PolicyVersion
+
+	persisted := false
 	if e.shouldPersist() {
 		if err = e.adapterCtx.AddPolicyCtx(ctx, sec, ptype, rule); err != nil {
 			if err.Error() != notImplemented {
+				_ = e.removePoliciesFromContextAdapter(ctx, sec, ptype, [][]string{rule})
 				return false, err
 			}
+		} else {
+			persisted = true
 		}
 	}
 
-	err = e.model.AddPolicy(sec, ptype, rule)
+	added, err := e.model.AddPoliciesWithAffected(sec, ptype, [][]string{rule})
 	if err != nil {
+		if persisted {
+			_ = e.removePoliciesFromContextAdapter(ctx, sec, ptype, [][]string{rule})
+		}
 		return false, err
+	}
+	if len(added) == 0 {
+		if persisted {
+			_ = e.removePoliciesFromContextAdapter(ctx, sec, ptype, [][]string{rule})
+		}
+		return false, nil
 	}
 
 	if sec == "g" {
-		err := e.BuildIncrementalRoleLinks(model.PolicyAdd, ptype, [][]string{rule})
+		err := e.BuildIncrementalRoleLinks(model.PolicyAdd, ptype, added)
 		if err != nil {
-			return true, err
+			e.restorePolicyState(sec, assertion, oldPolicy, oldPolicyMap, oldPolicyVersion)
+			if persisted {
+				_ = e.removePoliciesFromContextAdapter(ctx, sec, ptype, [][]string{rule})
+			}
+			return false, err
+		}
+
+		if err := e.validateConstraintsForGroupingPolicy(); err != nil {
+			e.restorePolicyState(sec, assertion, oldPolicy, oldPolicyMap, oldPolicyVersion)
+			if persisted {
+				_ = e.removePoliciesFromContextAdapter(ctx, sec, ptype, [][]string{rule})
+			}
+			return false, err
 		}
 	}
 
@@ -458,39 +488,107 @@ func (e *ContextEnforcer) addPoliciesWithoutNotifyCtx(ctx context.Context, sec s
 		return true, e.dispatcher.AddPolicies(sec, ptype, rules)
 	}
 
-	if !autoRemoveRepeat {
-		hasPolicies, err := e.model.HasPolicies(sec, ptype, rules)
-		if hasPolicies || err != nil {
-			return false, err
-		}
+	affected, anyExisting, err := e.prepareAddPolicies(sec, ptype, rules)
+	if err != nil {
+		return false, err
+	}
+	if !autoRemoveRepeat && anyExisting {
+		return false, nil
+	}
+	if len(affected) == 0 {
+		return true, nil
 	}
 
+	assertion, _ := e.model.GetAssertion(sec, ptype)
+	oldPolicy := assertion.Policy
+	oldPolicyMap := assertion.PolicyMap
+	oldPolicyVersion := assertion.PolicyVersion
+
+	persisted := false
 	if e.shouldPersist() {
-		if err := e.adapterCtx.(persist.ContextBatchAdapter).AddPoliciesCtx(ctx, sec, ptype, rules); err != nil {
+		if err := e.addPoliciesToContextAdapter(ctx, sec, ptype, affected); err != nil {
 			if err.Error() != notImplemented {
+				if rollbackErr := e.rollbackAdapterAddCtx(ctx, sec, ptype, affected); rollbackErr != nil {
+					return false, fmt.Errorf("%w; failed to roll back adapter: %v", err, rollbackErr)
+				}
 				return false, err
 			}
+		} else {
+			persisted = true
 		}
 	}
 
-	err := e.model.AddPolicies(sec, ptype, rules)
+	added, err := e.model.AddPoliciesWithAffected(sec, ptype, affected)
 	if err != nil {
+		if persisted {
+			_ = e.rollbackAdapterAddCtx(ctx, sec, ptype, affected)
+		}
 		return false, err
 	}
 
 	if sec == "g" {
-		err := e.BuildIncrementalRoleLinks(model.PolicyAdd, ptype, rules)
+		err := e.BuildIncrementalRoleLinks(model.PolicyAdd, ptype, added)
 		if err != nil {
-			return true, err
+			e.restorePolicyState(sec, assertion, oldPolicy, oldPolicyMap, oldPolicyVersion)
+			if persisted {
+				_ = e.rollbackAdapterAddCtx(ctx, sec, ptype, affected)
+			}
+			return false, err
 		}
 
-		err = e.BuildIncrementalConditionalRoleLinks(model.PolicyAdd, ptype, rules)
+		err = e.BuildIncrementalConditionalRoleLinks(model.PolicyAdd, ptype, added)
 		if err != nil {
-			return true, err
+			e.restorePolicyState(sec, assertion, oldPolicy, oldPolicyMap, oldPolicyVersion)
+			if persisted {
+				_ = e.rollbackAdapterAddCtx(ctx, sec, ptype, affected)
+			}
+			return false, err
 		}
 	}
 
 	return true, nil
+}
+
+func (e *ContextEnforcer) rollbackAdapterAddCtx(ctx context.Context, sec string, ptype string, rules [][]string) error {
+	if len(rules) == 0 || !e.shouldPersist() {
+		return nil
+	}
+	return e.removePoliciesFromContextAdapter(ctx, sec, ptype, rules)
+}
+
+func (e *ContextEnforcer) removePoliciesFromContextAdapter(ctx context.Context, sec string, ptype string, rules [][]string) error {
+	if len(rules) == 0 || e.adapterCtx == nil {
+		return nil
+	}
+	if batchAdapter, ok := e.adapterCtx.(persist.ContextBatchAdapter); ok {
+		if err := batchAdapter.RemovePoliciesCtx(ctx, sec, ptype, rules); err != nil && err.Error() != notImplemented {
+			return err
+		}
+		return nil
+	}
+
+	var firstErr error
+	for _, rule := range rules {
+		if err := e.adapterCtx.RemovePolicyCtx(ctx, sec, ptype, rule); err != nil && err.Error() != notImplemented && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+func (e *ContextEnforcer) addPoliciesToContextAdapter(ctx context.Context, sec string, ptype string, rules [][]string) error {
+	if e.adapterCtx == nil {
+		return nil
+	}
+	if batchAdapter, ok := e.adapterCtx.(persist.ContextBatchAdapter); ok {
+		return batchAdapter.AddPoliciesCtx(ctx, sec, ptype, rules)
+	}
+	for _, rule := range rules {
+		if err := e.adapterCtx.AddPolicyCtx(ctx, sec, ptype, rule); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // removePolicyWithoutNotifyCtx removes a rule from the current policy with context.

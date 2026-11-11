@@ -146,29 +146,52 @@ func (model Model) GetFilteredPolicy(sec string, ptype string, fieldIndex int, f
 	return res, nil
 }
 
+// validatePolicyRule checks that a rule has the shape required by its assertion.
+func validatePolicyRule(sec string, assertion *Assertion, rule []string) error {
+	switch sec {
+	case "p":
+		if len(rule) != len(assertion.Tokens) {
+			return fmt.Errorf(
+				"invalid policy rule size: expected %d, got %d, rule: %v",
+				len(assertion.Tokens),
+				len(rule),
+				rule)
+		}
+
+		if index, ok := assertion.FieldIndexMap[constant.PriorityIndex]; ok && (index < 0 || index >= len(rule)) {
+			return fmt.Errorf(
+				"invalid priority index %d for rule %v with %d fields",
+				index,
+				rule,
+				len(rule))
+		}
+	case "g":
+		// Grouping rules may carry additional conditional fields after the
+		// role-definition tokens, so only the lower bound is enforced here.
+		expected := len(assertion.Tokens)
+		if count := strings.Count(assertion.Value, "_"); count > expected {
+			expected = count
+		}
+		if len(rule) < expected {
+			return fmt.Errorf(
+				"invalid policy rule size: expected at least %d, got %d, rule: %v",
+				expected,
+				len(rule),
+				rule)
+		}
+	}
+
+	return nil
+}
+
 // HasPolicyEx determines whether a model has the specified policy rule with error.
 func (model Model) HasPolicyEx(sec string, ptype string, rule []string) (bool, error) {
 	assertion, err := model.GetAssertion(sec, ptype)
 	if err != nil {
 		return false, err
 	}
-	switch sec {
-	case "p":
-		if len(rule) != len(assertion.Tokens) {
-			return false, fmt.Errorf(
-				"invalid policy rule size: expected %d, got %d, rule: %v",
-				len(model["p"][ptype].Tokens),
-				len(rule),
-				rule)
-		}
-	case "g":
-		if len(rule) < len(assertion.Tokens) {
-			return false, fmt.Errorf(
-				"invalid policy rule size: expected %d, got %d, rule: %v",
-				len(model["g"][ptype].Tokens),
-				len(rule),
-				rule)
-		}
+	if err := validatePolicyRule(sec, assertion, rule); err != nil {
+		return false, err
 	}
 	return model.HasPolicy(sec, ptype, rule)
 }
@@ -198,15 +221,9 @@ func (model Model) HasPolicies(sec string, ptype string, rules [][]string) (bool
 	return false, nil
 }
 
-// AddPolicy adds a policy rule to the model.
-func (model Model) AddPolicy(sec string, ptype string, rule []string) error {
-	assertion, err := model.GetAssertion(sec, ptype)
-	if err != nil {
-		return err
-	}
+func addPolicyToAssertion(sec string, assertion *Assertion, rule []string) {
 	assertion.Policy = append(assertion.Policy, rule)
-	assertion.PolicyMap[strings.Join(rule, DefaultSep)] = len(model[sec][ptype].Policy) - 1
-	assertion.PolicyVersion++
+	assertion.PolicyMap[strings.Join(rule, DefaultSep)] = len(assertion.Policy) - 1
 
 	hasPriority := false
 	if _, ok := assertion.FieldIndexMap[constant.PriorityIndex]; ok {
@@ -227,6 +244,24 @@ func (model Model) AddPolicy(sec string, ptype string, rule []string) error {
 			assertion.PolicyMap[strings.Join(rule, DefaultSep)] = i
 		}
 	}
+}
+
+// AddPolicy adds a policy rule to the model.
+func (model Model) AddPolicy(sec string, ptype string, rule []string) error {
+	assertion, err := model.GetAssertion(sec, ptype)
+	if err != nil {
+		return err
+	}
+	if err := validatePolicyRule(sec, assertion, rule); err != nil {
+		return err
+	}
+	if sec == "p" {
+		// Resolve the priority token before inserting so a standalone AddPolicy
+		// honors explicit priority models just like a loaded policy does.
+		_, _ = model.GetFieldIndex(ptype, constant.PriorityIndex)
+	}
+	addPolicyToAssertion(sec, assertion, rule)
+	assertion.PolicyVersion++
 	return nil
 }
 
@@ -238,24 +273,64 @@ func (model Model) AddPolicies(sec string, ptype string, rules [][]string) error
 
 // AddPoliciesWithAffected adds policy rules to the model, and returns affected rules.
 func (model Model) AddPoliciesWithAffected(sec string, ptype string, rules [][]string) ([][]string, error) {
-	_, err := model.GetAssertion(sec, ptype)
+	assertion, err := model.GetAssertion(sec, ptype)
 	if err != nil {
 		return nil, err
 	}
+	// Validate the whole batch before touching the model. This keeps an invalid
+	// rule at any position from leaving the earlier rules half-applied.
+	for _, rule := range rules {
+		if err := validatePolicyRule(sec, assertion, rule); err != nil {
+			return nil, err
+		}
+	}
+	if sec == "p" {
+		// Resolve the priority token once for the whole batch.
+		_, _ = model.GetFieldIndex(ptype, constant.PriorityIndex)
+	}
+
 	var affected [][]string
+	seen := make(map[string]struct{}, len(rules))
 	for _, rule := range rules {
 		hashKey := strings.Join(rule, DefaultSep)
 		_, ok := model[sec][ptype].PolicyMap[hashKey]
 		if ok {
 			continue
 		}
-		affected = append(affected, rule)
-		err = model.AddPolicy(sec, ptype, rule)
-		if err != nil {
-			return affected, err
+		if _, ok := seen[hashKey]; ok {
+			continue
 		}
+		seen[hashKey] = struct{}{}
+		affected = append(affected, rule)
 	}
-	return affected, err
+
+	if len(affected) == 0 {
+		return affected, nil
+	}
+
+	// Stage the complete result on copies of the policy and index, then swap
+	// them in with no fallible operations in between.
+	policy := make([][]string, len(assertion.Policy), len(assertion.Policy)+len(affected))
+	copy(policy, assertion.Policy)
+	policyMap := make(map[string]int, len(assertion.PolicyMap)+len(affected))
+	for key, index := range assertion.PolicyMap {
+		policyMap[key] = index
+	}
+
+	staged := &Assertion{
+		Policy:        policy,
+		PolicyMap:     policyMap,
+		FieldIndexMap: assertion.FieldIndexMap,
+	}
+	for _, rule := range affected {
+		addPolicyToAssertion(sec, staged, rule)
+	}
+
+	assertion.Policy = staged.Policy
+	assertion.PolicyMap = staged.PolicyMap
+	assertion.PolicyVersion++
+
+	return affected, nil
 }
 
 // RemovePolicy removes a policy rule from the model.

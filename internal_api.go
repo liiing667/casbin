@@ -19,6 +19,7 @@ package casbin
 
 import (
 	"fmt"
+	"strings"
 
 	Err "github.com/casbin/casbin/v3/errors"
 	"github.com/casbin/casbin/v3/log"
@@ -38,6 +39,96 @@ func (e *Enforcer) shouldNotify() bool {
 	return e.watcher != nil && e.autoNotifyWatcher
 }
 
+// prepareAddPolicies validates the target assertion and every rule before any
+// adapter or model write. The returned rules are the unique, non-existing
+// rules in input order, which is the stable affected list for the operation.
+func (e *Enforcer) prepareAddPolicies(sec string, ptype string, rules [][]string) ([][]string, bool, error) {
+	if _, err := e.model.GetAssertion(sec, ptype); err != nil {
+		return nil, false, err
+	}
+
+	var affected [][]string
+	seen := make(map[string]struct{}, len(rules))
+	anyExisting := false
+	for _, rule := range rules {
+		hasPolicy, err := e.model.HasPolicyEx(sec, ptype, rule)
+		if err != nil {
+			return nil, false, err
+		}
+		if hasPolicy {
+			anyExisting = true
+			continue
+		}
+
+		key := strings.Join(rule, model.DefaultSep)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		affected = append(affected, rule)
+	}
+
+	return affected, anyExisting, nil
+}
+
+// rollbackAdapterAdd removes rules that may have been written by a failed
+// batch add. Rules passed here were verified as new before the write, so this
+// cannot remove a pre-existing rule.
+func (e *Enforcer) rollbackAdapterAdd(sec string, ptype string, rules [][]string) error {
+	if len(rules) == 0 || !e.shouldPersist() {
+		return nil
+	}
+	return e.removePoliciesFromAdapter(sec, ptype, rules)
+}
+
+func (e *Enforcer) removePoliciesFromAdapter(sec string, ptype string, rules [][]string) error {
+	if len(rules) == 0 || e.adapter == nil {
+		return nil
+	}
+	if batchAdapter, ok := e.adapter.(persist.BatchAdapter); ok {
+		if err := batchAdapter.RemovePolicies(sec, ptype, rules); err != nil && err.Error() != notImplemented {
+			return err
+		}
+		return nil
+	}
+
+	var firstErr error
+	for _, rule := range rules {
+		if err := e.adapter.RemovePolicy(sec, ptype, rule); err != nil && err.Error() != notImplemented && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+func (e *Enforcer) addPoliciesToAdapter(sec string, ptype string, rules [][]string) error {
+	if e.adapter == nil {
+		return nil
+	}
+	if batchAdapter, ok := e.adapter.(persist.BatchAdapter); ok {
+		return batchAdapter.AddPolicies(sec, ptype, rules)
+	}
+	for _, rule := range rules {
+		if err := e.adapter.AddPolicy(sec, ptype, rule); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// restorePolicyState puts the policy back after a post-write validation or
+// role-link failure, then rebuilds all role links from that restored state.
+func (e *Enforcer) restorePolicyState(sec string, assertion *model.Assertion, policy [][]string, policyMap map[string]int, policyVersion uint64) {
+	assertion.Policy = policy
+	assertion.PolicyMap = policyMap
+	assertion.PolicyVersion = policyVersion
+
+	if sec == "g" {
+		_ = e.BuildRoleLinks()
+		_ = e.rebuildConditionalRoleLinks(e.model)
+	}
+}
+
 // validateConstraintsForGroupingPolicy validates constraints for grouping policy changes.
 // It returns an error if constraint validation fails.
 func (e *Enforcer) validateConstraintsForGroupingPolicy() error {
@@ -52,32 +143,60 @@ func (e *Enforcer) addPolicyWithoutNotify(sec string, ptype string, rule []strin
 		return true, e.dispatcher.AddPolicies(sec, ptype, [][]string{rule})
 	}
 
-	hasPolicy, err := e.model.HasPolicy(sec, ptype, rule)
+	hasPolicy, err := e.model.HasPolicyEx(sec, ptype, rule)
 	if hasPolicy || err != nil {
 		return false, err
 	}
 
+	// Validate the rule before any adapter write so a malformed rule cannot
+	// leave storage and memory out of sync.
+	assertion, _ := e.model.GetAssertion(sec, ptype)
+	oldPolicy := assertion.Policy
+	oldPolicyMap := assertion.PolicyMap
+	oldPolicyVersion := assertion.PolicyVersion
+
+	persisted := false
 	if e.shouldPersist() {
 		if err = e.adapter.AddPolicy(sec, ptype, rule); err != nil {
 			if err.Error() != notImplemented {
+				_ = e.removePoliciesFromAdapter(sec, ptype, [][]string{rule})
 				return false, err
 			}
+		} else {
+			persisted = true
 		}
 	}
 
-	err = e.model.AddPolicy(sec, ptype, rule)
+	added, err := e.model.AddPoliciesWithAffected(sec, ptype, [][]string{rule})
 	if err != nil {
+		if persisted {
+			_ = e.removePoliciesFromAdapter(sec, ptype, [][]string{rule})
+		}
 		return false, err
+	}
+	if len(added) == 0 {
+		if persisted {
+			_ = e.removePoliciesFromAdapter(sec, ptype, [][]string{rule})
+		}
+		return false, nil
 	}
 
 	if sec == "g" {
-		err := e.BuildIncrementalRoleLinks(model.PolicyAdd, ptype, [][]string{rule})
+		err := e.BuildIncrementalRoleLinks(model.PolicyAdd, ptype, added)
 		if err != nil {
-			return true, err
+			e.restorePolicyState(sec, assertion, oldPolicy, oldPolicyMap, oldPolicyVersion)
+			if persisted {
+				_ = e.removePoliciesFromAdapter(sec, ptype, [][]string{rule})
+			}
+			return false, err
 		}
 
 		// Validate constraints after adding grouping policy
 		if err := e.validateConstraintsForGroupingPolicy(); err != nil {
+			e.restorePolicyState(sec, assertion, oldPolicy, oldPolicyMap, oldPolicyVersion)
+			if persisted {
+				_ = e.removePoliciesFromAdapter(sec, ptype, [][]string{rule})
+			}
 			return false, err
 		}
 	}
@@ -95,39 +214,69 @@ func (e *Enforcer) addPoliciesWithoutNotify(sec string, ptype string, rules [][]
 		return true, e.dispatcher.AddPolicies(sec, ptype, rules)
 	}
 
-	if !autoRemoveRepeat {
-		hasPolicies, err := e.model.HasPolicies(sec, ptype, rules)
-		if hasPolicies || err != nil {
-			return false, err
-		}
+	affected, anyExisting, err := e.prepareAddPolicies(sec, ptype, rules)
+	if err != nil {
+		return false, err
+	}
+	if !autoRemoveRepeat && anyExisting {
+		return false, nil
+	}
+	if len(affected) == 0 {
+		return true, nil
 	}
 
+	assertion, _ := e.model.GetAssertion(sec, ptype)
+	oldPolicy := assertion.Policy
+	oldPolicyMap := assertion.PolicyMap
+	oldPolicyVersion := assertion.PolicyVersion
+
+	persisted := false
 	if e.shouldPersist() {
-		if err := e.adapter.(persist.BatchAdapter).AddPolicies(sec, ptype, rules); err != nil {
+		if err := e.addPoliciesToAdapter(sec, ptype, affected); err != nil {
 			if err.Error() != notImplemented {
+				if rollbackErr := e.rollbackAdapterAdd(sec, ptype, affected); rollbackErr != nil {
+					return false, fmt.Errorf("%w; failed to roll back adapter: %v", err, rollbackErr)
+				}
 				return false, err
 			}
+		} else {
+			persisted = true
 		}
 	}
 
-	err := e.model.AddPolicies(sec, ptype, rules)
+	added, err := e.model.AddPoliciesWithAffected(sec, ptype, affected)
 	if err != nil {
+		if persisted {
+			_ = e.rollbackAdapterAdd(sec, ptype, affected)
+		}
 		return false, err
 	}
 
 	if sec == "g" {
-		err := e.BuildIncrementalRoleLinks(model.PolicyAdd, ptype, rules)
+		err := e.BuildIncrementalRoleLinks(model.PolicyAdd, ptype, added)
 		if err != nil {
-			return true, err
+			e.restorePolicyState(sec, assertion, oldPolicy, oldPolicyMap, oldPolicyVersion)
+			if persisted {
+				_ = e.rollbackAdapterAdd(sec, ptype, affected)
+			}
+			return false, err
 		}
 
-		err = e.BuildIncrementalConditionalRoleLinks(model.PolicyAdd, ptype, rules)
+		err = e.BuildIncrementalConditionalRoleLinks(model.PolicyAdd, ptype, added)
 		if err != nil {
-			return true, err
+			e.restorePolicyState(sec, assertion, oldPolicy, oldPolicyMap, oldPolicyVersion)
+			if persisted {
+				_ = e.rollbackAdapterAdd(sec, ptype, affected)
+			}
+			return false, err
 		}
 
 		// Validate constraints after adding grouping policies
 		if err := e.validateConstraintsForGroupingPolicy(); err != nil {
+			e.restorePolicyState(sec, assertion, oldPolicy, oldPolicyMap, oldPolicyVersion)
+			if persisted {
+				_ = e.rollbackAdapterAdd(sec, ptype, affected)
+			}
 			return false, err
 		}
 	}

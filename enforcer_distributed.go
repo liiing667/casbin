@@ -18,6 +18,8 @@
 package casbin
 
 import (
+	"fmt"
+
 	"github.com/casbin/casbin/v3/model"
 	"github.com/casbin/casbin/v3/persist"
 )
@@ -50,37 +52,54 @@ func (d *DistributedEnforcer) AddPoliciesSelf(shouldPersist func() bool, sec str
 
 	d.m.Lock()
 	defer d.m.Unlock()
+
+	affected, _, err = d.prepareAddPolicies(sec, ptype, rules)
+	if err != nil {
+		return nil, err
+	}
+	if len(affected) == 0 {
+		return affected, nil
+	}
+
+	assertion, _ := d.model.GetAssertion(sec, ptype)
+	oldPolicy := assertion.Policy
+	oldPolicyMap := assertion.PolicyMap
+	oldPolicyVersion := assertion.PolicyVersion
+
+	persisted := false
 	if shouldPersist != nil && shouldPersist() {
-		var noExistsPolicy [][]string
-		for _, rule := range rules {
-			var hasPolicy bool
-			hasPolicy, err = d.model.HasPolicy(sec, ptype, rule)
-			if err != nil {
+		if err = d.addPoliciesToAdapter(sec, ptype, affected); err != nil {
+			if err.Error() != notImplemented {
+				if rollbackErr := d.removePoliciesFromAdapter(sec, ptype, affected); rollbackErr != nil {
+					return nil, fmt.Errorf("%w; failed to roll back adapter: %v", err, rollbackErr)
+				}
 				return nil, err
 			}
-			if !hasPolicy {
-				noExistsPolicy = append(noExistsPolicy, rule)
-			}
+		} else {
+			persisted = true
 		}
+	}
 
-		if err = d.adapter.(persist.BatchAdapter).AddPolicies(sec, ptype, noExistsPolicy); err != nil && err.Error() != notImplemented {
+	added, err := d.model.AddPoliciesWithAffected(sec, ptype, affected)
+	if err != nil {
+		if persisted {
+			_ = d.removePoliciesFromAdapter(sec, ptype, affected)
+		}
+		return nil, err
+	}
+
+	if sec == "g" {
+		err := d.BuildIncrementalRoleLinks(model.PolicyAdd, ptype, added)
+		if err != nil {
+			d.restorePolicyState(sec, assertion, oldPolicy, oldPolicyMap, oldPolicyVersion)
+			if persisted {
+				_ = d.removePoliciesFromAdapter(sec, ptype, affected)
+			}
 			return nil, err
 		}
 	}
 
-	affected, err = d.model.AddPoliciesWithAffected(sec, ptype, rules)
-	if err != nil {
-		return affected, err
-	}
-
-	if sec == "g" {
-		err := d.BuildIncrementalRoleLinks(model.PolicyAdd, ptype, affected)
-		if err != nil {
-			return affected, err
-		}
-	}
-
-	return affected, nil
+	return added, nil
 }
 
 // RemovePoliciesSelf provides a method for dispatcher to remove a set of rules from current policy.
