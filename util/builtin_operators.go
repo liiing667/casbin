@@ -21,12 +21,14 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/bmatcuk/doublestar/v4"
 
@@ -210,6 +212,71 @@ func (c *patternCache) len() int {
 	return c.size
 }
 
+// hasPathConfusion reports whether key1 is an out-of-bounds alias: a string that
+// a downstream HTTP server, framework, or filesystem can resolve to a different
+// path than the one the matcher is about to approve.
+//
+// The KeyMatch family compares raw strings, but the request is routed only after
+// the server percent-decodes it, collapses repeated slashes, resolves "." and
+// ".." segments, and (on Windows) treats "\" as a separator and strips trailing
+// dots and spaces from each segment. When any of those rewrites changes the
+// path, approving the raw string approves a resource the request never named:
+// "/public/../admin" matches "/public/*" yet is served as "/admin". The matchers
+// therefore fail closed on:
+//
+//   - percent-encoding: key1 is decoded until stable (bounded, so "%252e" cannot
+//     hide a second layer a decoding proxy would still unfold); invalid
+//     sequences and non-UTF-8 results fail closed
+//   - a decoded "\", NUL, or "//" run anywhere
+//   - any segment made only of dots and spaces: "." and ".." are traversal
+//     segments, and "...", ".. " and friends are their Windows-normalized aliases
+//
+// Legitimate encodings are unaffected: "/files/%E4%B8%AD%E6%96%87" decodes to a
+// harmless name and still matches "/files/*". key2 is policy and is not checked;
+// a confused key1 is rejected no matter what it would have matched, including
+// the bare "*" wildcard.
+func hasPathConfusion(key1 string) bool {
+	// Fast path: with no percent-encoding, backslash, dot, or NUL there is
+	// nothing to decode and no segment can be a dot segment, so only a "//"
+	// run could still be suspicious. Domain-style keys ("team/123") take this
+	// path with two scans and no allocation.
+	if !strings.ContainsAny(key1, "%\\.\x00") && !strings.Contains(key1, "//") {
+		return false
+	}
+
+	decoded := key1
+	stable := false
+	for i := 0; i < 8; i++ {
+		next, err := url.PathUnescape(decoded)
+		if err != nil {
+			// Invalid encoding: servers disagree on how to treat it.
+			return true
+		}
+		if next == decoded {
+			stable = true
+			break
+		}
+		decoded = next
+	}
+	if !stable {
+		return true
+	}
+
+	if !utf8.ValidString(decoded) {
+		// Includes overlong encodings such as "%c0%ae", a smuggled ".".
+		return true
+	}
+	if strings.ContainsAny(decoded, "\\\x00") || strings.Contains(decoded, "//") {
+		return true
+	}
+	for _, seg := range strings.Split(decoded, "/") {
+		if seg != "" && strings.Trim(seg, ". ") == "" {
+			return true
+		}
+	}
+	return false
+}
+
 var (
 	keyMatch2Cache patternCache
 	keyMatch3Cache patternCache
@@ -246,7 +313,13 @@ func validateVariadicStringArgs(expectedLen int, args ...string) error {
 
 // KeyMatch determines whether key1 matches the pattern of key2 (similar to RESTful path), key2 can contain a *.
 // For example, "/foo/bar" matches "/foo/*".
+// A key1 that is an out-of-bounds alias (encoded or literal traversal segments,
+// repeated slashes, backslashes) matches nothing; see hasPathConfusion.
 func KeyMatch(key1 string, key2 string) bool {
+	if hasPathConfusion(key1) {
+		return false
+	}
+
 	i := strings.Index(key2, "*")
 	if i == -1 {
 		return key1 == key2
@@ -273,7 +346,12 @@ func KeyMatchFunc(args ...interface{}) (interface{}, error) {
 // KeyGet returns the matched part
 // For example, "/foo/bar/foo" matches "/foo/*"
 // "bar/foo" will been returned.
+// An out-of-bounds alias (see hasPathConfusion) returns "".
 func KeyGet(key1, key2 string) string {
+	if hasPathConfusion(key1) {
+		return ""
+	}
+
 	i := strings.Index(key2, "*")
 	if i == -1 {
 		return ""
@@ -301,12 +379,17 @@ func KeyGetFunc(args ...interface{}) (interface{}, error) {
 // KeyMatch2 determines whether key1 matches the pattern of key2 (similar to RESTful path), key2 can contain a *.
 // For example, "/foo/bar" matches "/foo/*", "/resource1" matches "/:resource".
 // An invalid pattern matches nothing; KeyMatch2Func reports it as an error.
+// A key1 that is an out-of-bounds alias (see hasPathConfusion) matches nothing.
 func KeyMatch2(key1 string, key2 string) bool {
 	matched, _ := keyMatch2(key1, key2)
 	return matched
 }
 
 func keyMatch2(key1 string, key2 string) (bool, error) {
+	if hasPathConfusion(key1) {
+		return false, nil
+	}
+
 	if matched, ok := keyMatchShortcut(key1, key2, ":"); ok {
 		return matched, nil
 	}
@@ -343,6 +426,7 @@ func KeyMatch2Func(args ...interface{}) (interface{}, error) {
 // For example, "/resource1" matches "/:resource"
 // if the pathVar == "resource", then "resource1" will be returned.
 // An invalid pattern returns ""; KeyGet2Func reports it as an error.
+// An out-of-bounds alias (see hasPathConfusion) returns "".
 func KeyGet2(key1, key2 string, pathVar string) string {
 	value, _ := keyGet(keyGet2Cache.get(key2, buildKeyGet2), key1, pathVar)
 	return value
@@ -351,6 +435,10 @@ func KeyGet2(key1, key2 string, pathVar string) string {
 func keyGet(p *compiledPattern, key1 string, pathVar string) (string, error) {
 	if p.err != nil {
 		return "", p.err
+	}
+
+	if hasPathConfusion(key1) {
+		return "", nil
 	}
 
 	values := p.re.FindStringSubmatch(key1)
@@ -400,12 +488,17 @@ func KeyGet2Func(args ...interface{}) (interface{}, error) {
 // KeyMatch3 determines whether key1 matches the pattern of key2 (similar to RESTful path), key2 can contain a *.
 // For example, "/foo/bar" matches "/foo/*", "/resource1" matches "/{resource}".
 // An invalid pattern matches nothing; KeyMatch3Func reports it as an error.
+// A key1 that is an out-of-bounds alias (see hasPathConfusion) matches nothing.
 func KeyMatch3(key1 string, key2 string) bool {
 	matched, _ := keyMatch3(key1, key2)
 	return matched
 }
 
 func keyMatch3(key1 string, key2 string) (bool, error) {
+	if hasPathConfusion(key1) {
+		return false, nil
+	}
+
 	if matched, ok := keyMatchShortcut(key1, key2, ""); ok {
 		return matched, nil
 	}
@@ -441,6 +534,7 @@ func KeyMatch3Func(args ...interface{}) (interface{}, error) {
 // For example, "project/proj_project1_admin/" matches "project/proj_{project}_admin/"
 // if the pathVar == "project", then "project1" will be returned.
 // An invalid pattern returns ""; KeyGet3Func reports it as an error.
+// An out-of-bounds alias (see hasPathConfusion) returns "".
 func KeyGet3(key1, key2 string, pathVar string) string {
 	value, _ := keyGet(keyGet3Cache.get(key2, buildKeyGet3), key1, pathVar)
 	return value
@@ -485,12 +579,17 @@ func KeyGet3Func(args ...interface{}) (interface{}, error) {
 // "/parent/123/child/456" does not match "/parent/{id}/child/{id}"
 // But KeyMatch3 will match both.
 // An invalid pattern matches nothing; KeyMatch4Func reports it as an error.
+// A key1 that is an out-of-bounds alias (see hasPathConfusion) matches nothing.
 func KeyMatch4(key1 string, key2 string) bool {
 	matched, _ := keyMatch4(key1, key2)
 	return matched
 }
 
 func keyMatch4(key1 string, key2 string) (bool, error) {
+	if hasPathConfusion(key1) {
+		return false, nil
+	}
+
 	if matched, ok := keyMatchShortcut(key1, key2, ""); ok {
 		return matched, nil
 	}
@@ -557,6 +656,9 @@ func KeyMatch4Func(args ...interface{}) (interface{}, error) {
 // - "/parent/child1" and "/parent/child1" matches "/parent/*"
 // - "/parent/child1?status=1" matches "/parent/*".
 // An invalid pattern matches nothing; KeyMatch5Func reports it as an error.
+// A key1 whose path part is an out-of-bounds alias (see hasPathConfusion)
+// matches nothing; the query string is stripped before that check, so it may
+// hold anything.
 func KeyMatch5(key1 string, key2 string) bool {
 	matched, _ := keyMatch5(key1, key2)
 	return matched
@@ -567,6 +669,10 @@ func keyMatch5(key1 string, key2 string) (bool, error) {
 
 	if i != -1 {
 		key1 = key1[:i]
+	}
+
+	if hasPathConfusion(key1) {
+		return false, nil
 	}
 
 	// After the query string is stripped, so that key1 is compared in the same
@@ -675,7 +781,12 @@ func IPMatchFunc(args ...interface{}) (interface{}, error) {
 }
 
 // GlobMatch determines whether key1 matches the pattern of key2 using glob pattern.
+// A key1 that is an out-of-bounds alias (see hasPathConfusion) matches nothing.
 func GlobMatch(key1 string, key2 string) (bool, error) {
+	if hasPathConfusion(key1) {
+		return false, nil
+	}
+
 	return doublestar.Match(key2, key1)
 }
 
