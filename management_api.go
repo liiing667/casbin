@@ -141,8 +141,6 @@ func (e *Enforcer) GetFilteredNamedPolicyWithMatcher(ptype string, matcher strin
 	var res [][]string
 	var err error
 
-	functions := e.getMatcherFunctions()
-
 	var expString string
 	if matcher == "" {
 		return res, fmt.Errorf("matcher is empty")
@@ -152,7 +150,7 @@ func (e *Enforcer) GetFilteredNamedPolicyWithMatcher(ptype string, matcher strin
 
 	var expression *govaluate.EvaluableExpression
 
-	expression, err = govaluate.NewEvaluableExpressionWithFunctions(expString, functions)
+	expression, err = e.compileMatcherExpression(false, expString, nil)
 	if err != nil {
 		return res, err
 	}
@@ -471,6 +469,9 @@ func (e *Enforcer) RemoveFilteredNamedGroupingPolicy(ptype string, fieldIndex in
 // AddFunction adds a customized function.
 func (e *Enforcer) AddFunction(name string, function govaluate.ExpressionFunction) {
 	e.fm.AddFunction(name, function)
+	// Compiled matchers capture the function set, so drop them and let the
+	// next enforcement compile against the authoritative, current set.
+	e.invalidateMatcherMap()
 }
 
 func (e *Enforcer) SelfAddPolicy(sec string, ptype string, rule []string) (bool, error) {

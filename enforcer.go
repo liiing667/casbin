@@ -867,19 +867,19 @@ func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interfac
 		pTokens: pTokens,
 	}
 
-	hasEval := util.HasEval(expString)
-	var expression *govaluate.EvaluableExpression
-	expression, err = e.getAndStoreMatcherExpression(hasEval, expString, &parameters)
-	if err != nil {
-		return false, err
-	}
-
 	if len(e.model["r"][rType].Tokens) != len(rvals) {
 		return false, fmt.Errorf(
 			"invalid request size: expected %d, got %d, rvals: %v",
 			len(e.model["r"][rType].Tokens),
 			len(rvals),
 			rvals)
+	}
+
+	hasEval := util.HasEval(expString)
+	var expression *govaluate.EvaluableExpression
+	expression, err = e.getAndStoreMatcherExpression(hasEval, expString, &parameters)
+	if err != nil {
+		return false, err
 	}
 
 	policyLen := len(e.model["p"][pType].Policy)
@@ -1033,22 +1033,36 @@ func (e *Enforcer) getMatcherFunctions() map[string]govaluate.ExpressionFunction
 }
 
 func (e *Enforcer) getAndStoreMatcherExpression(hasEval bool, expString string, parameters *enforceParameters) (*govaluate.EvaluableExpression, error) {
-	if !hasEval {
-		if cachedExpression, ok := e.matcherMap.Load(expString); ok {
-			return cachedExpression.(*govaluate.EvaluableExpression), nil
-		}
+	if hasEval {
+		// An eval() matcher is bound to this request's parameters, so the
+		// compiled expression is request-scoped and must never be shared
+		// through the matcher cache.
+		return e.compileMatcherExpression(hasEval, expString, parameters)
 	}
 
-	functions := e.getMatcherFunctions()
-	if hasEval {
-		functions["eval"] = generateEvalFunction(functions, parameters)
+	if cachedExpression, ok := e.matcherMap.Load(expString); ok {
+		return cachedExpression.(*govaluate.EvaluableExpression), nil
 	}
-	expression, err := govaluate.NewEvaluableExpressionWithFunctions(expString, functions)
+
+	expression, err := e.compileMatcherExpression(hasEval, expString, parameters)
 	if err != nil {
 		return nil, err
 	}
 	e.matcherMap.Store(expString, expression)
 	return expression, nil
+}
+
+// compileMatcherExpression is the single place where matcher text becomes an
+// executable expression. It snapshots the enforcer's current function set and,
+// for eval() matchers, binds eval to the given request's parameters, so the
+// expression source, the function set and the request parameters always come
+// from one authoritative context.
+func (e *Enforcer) compileMatcherExpression(hasEval bool, expString string, parameters *enforceParameters) (*govaluate.EvaluableExpression, error) {
+	functions := e.getMatcherFunctions()
+	if hasEval {
+		functions["eval"] = generateEvalFunction(functions, parameters)
+	}
+	return govaluate.NewEvaluableExpressionWithFunctions(expString, functions)
 }
 
 // Enforce decides whether a "subject" can access a "object" with the operation "action", input parameters are usually: (sub, obj, act).
@@ -1180,13 +1194,13 @@ func (p enforceParameters) Get(name string) (interface{}, error) {
 	switch name[0] {
 	case 'p':
 		i, ok := p.pTokens[name]
-		if !ok {
+		if !ok || i < 0 || i >= len(p.pVals) {
 			return nil, errors.New("No parameter '" + name + "' found.")
 		}
 		return p.pVals[i], nil
 	case 'r':
 		i, ok := p.rTokens[name]
-		if !ok {
+		if !ok || i < 0 || i >= len(p.rVals) {
 			return nil, errors.New("No parameter '" + name + "' found.")
 		}
 		return p.rVals[i], nil
