@@ -29,14 +29,16 @@ import (
 
 // CachedEnforcer wraps Enforcer and provides decision cache.
 type CachedEnforcer struct {
-	// cacheVersion is accessed atomically, so it stays first to be 64-bit aligned on 32-bit platforms.
-	cacheVersion uint64
 	*Enforcer
 	expireTime  time.Duration
-	cache       cache.Cache
+	cache       *generationCache
 	enableCache int32
-	locker      *sync.RWMutex
-	// concurrentCache reports whether cache is safe for concurrent use, so reading it needs no lock.
+	// barrier makes a policy or role-link change (together with its cache
+	// invalidation) atomic relative to Enforce. Enforce holds it as a read
+	// lock, so concurrent-safe cache backends still serve parallel cache hits.
+	barrier sync.RWMutex
+	// concurrentCache reports whether the backing cache is safe for concurrent
+	// use; a plain map cache is only accessed while barrier is held exclusively.
 	concurrentCache bool
 }
 
@@ -54,10 +56,9 @@ func NewCachedEnforcer(params ...interface{}) (*CachedEnforcer, error) {
 	}
 
 	e.enableCache = 1
-	e.cache, _ = cache.NewConcurrentCache(cache.DefaultConcurrentCacheSize)
+	innerCache, _ := cache.NewConcurrentCache(cache.DefaultConcurrentCacheSize)
+	e.cache = newGenerationCache(innerCache)
 	e.concurrentCache = true
-	e.locker = new(sync.RWMutex)
-	e.cacheVersion = e.getPolicyVersion()
 	return e, nil
 }
 
@@ -82,12 +83,11 @@ func (e *CachedEnforcer) Enforce(rvals ...interface{}) (bool, error) {
 		return e.Enforcer.Enforce(rvals...)
 	}
 
-	version := e.getPolicyVersion()
-	if err := e.syncCacheVersion(version); err != nil {
-		return false, err
-	}
+	e.lockEnforceRead()
+	defer e.unlockEnforceRead()
 
-	if res, err := e.getCachedResult(key); err == nil {
+	snapshot := e.cache.currentGeneration()
+	if res, err := e.cache.getForGeneration(snapshot, key); err == nil {
 		return res, nil
 	} else if err != cache.ErrNoSuchKey {
 		return res, err
@@ -97,66 +97,132 @@ func (e *CachedEnforcer) Enforce(rvals ...interface{}) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	// The barrier guarantees the generation cannot change while this decision
+	// is being computed, so the result is safe to tag with the snapshot.
+	if err := e.cache.set(snapshot, key, res, e.expireTime); err != nil {
+		return res, err
+	}
+	return res, nil
+}
 
-	err = e.setCachedResult(version, key, res, e.expireTime)
-	return res, err
+// lockEnforceRead takes the barrier read lock for a concurrent-safe backend,
+// or an exclusive lock for a backend that is not safe for concurrent use.
+func (e *CachedEnforcer) lockEnforceRead() {
+	if e.concurrentCache {
+		e.barrier.RLock()
+		return
+	}
+	e.barrier.Lock()
+}
+
+func (e *CachedEnforcer) unlockEnforceRead() {
+	if e.concurrentCache {
+		e.barrier.RUnlock()
+		return
+	}
+	e.barrier.Unlock()
+}
+
+// mutate runs a policy or role-link change and, after it has finished, advances
+// the cache generation so every cached decision from the previous state is
+// discarded. The write lock makes the change and the invalidation atomic.
+func (e *CachedEnforcer) mutate(fn func() (bool, error)) (bool, error) {
+	e.barrier.Lock()
+	defer e.barrier.Unlock()
+	affected, err := fn()
+	if err != nil {
+		return affected, err
+	}
+	if err := e.invalidateCache(); err != nil {
+		return affected, err
+	}
+	return affected, nil
+}
+
+// mutateErr is the error-returning variant of mutate, used by LoadPolicy.
+func (e *CachedEnforcer) mutateErr(fn func() error) error {
+	e.barrier.Lock()
+	defer e.barrier.Unlock()
+	if err := fn(); err != nil {
+		return err
+	}
+	return e.invalidateCache()
+}
+
+func (e *CachedEnforcer) invalidateCache() error {
+	if atomic.LoadInt32(&e.enableCache) == 0 {
+		return nil
+	}
+	return e.cache.clear()
 }
 
 func (e *CachedEnforcer) LoadPolicy() error {
-	if atomic.LoadInt32(&e.enableCache) != 0 {
-		if err := e.cache.Clear(); err != nil {
-			return err
-		}
-	}
-	return e.Enforcer.LoadPolicy()
+	return e.mutateErr(e.Enforcer.LoadPolicy)
+}
+
+func (e *CachedEnforcer) AddPolicy(params ...interface{}) (bool, error) {
+	return e.mutate(func() (bool, error) {
+		return e.Enforcer.AddPolicy(params...)
+	})
+}
+
+func (e *CachedEnforcer) AddPolicies(rules [][]string) (bool, error) {
+	return e.mutate(func() (bool, error) {
+		return e.Enforcer.AddPolicies(rules)
+	})
 }
 
 func (e *CachedEnforcer) RemovePolicy(params ...interface{}) (bool, error) {
-	if atomic.LoadInt32(&e.enableCache) != 0 {
-		key, ok := e.getKey(params...)
-		if ok {
-			if err := e.cache.Delete(key); err != nil && err != cache.ErrNoSuchKey {
-				return false, err
-			}
-		}
-	}
-	return e.Enforcer.RemovePolicy(params...)
+	return e.mutate(func() (bool, error) {
+		return e.Enforcer.RemovePolicy(params...)
+	})
 }
 
 func (e *CachedEnforcer) RemovePolicies(rules [][]string) (bool, error) {
-	if len(rules) != 0 {
-		if atomic.LoadInt32(&e.enableCache) != 0 {
-			for _, rule := range rules {
-				irule := make([]interface{}, len(rule))
-				for i, param := range rule {
-					irule[i] = param
-				}
-				key, _ := e.getKey(irule...)
-				if err := e.cache.Delete(key); err != nil && err != cache.ErrNoSuchKey {
-					return false, err
-				}
-			}
-		}
-	}
-	return e.Enforcer.RemovePolicies(rules)
+	return e.mutate(func() (bool, error) {
+		return e.Enforcer.RemovePolicies(rules)
+	})
 }
 
-func (e *CachedEnforcer) getCachedResult(key string) (res bool, err error) {
-	if e.concurrentCache {
-		return e.cache.Get(key)
-	}
-	e.locker.Lock()
-	defer e.locker.Unlock()
-	return e.cache.Get(key)
+func (e *CachedEnforcer) RemoveFilteredPolicy(fieldIndex int, fieldValues ...string) (bool, error) {
+	return e.mutate(func() (bool, error) {
+		return e.Enforcer.RemoveFilteredPolicy(fieldIndex, fieldValues...)
+	})
+}
+
+func (e *CachedEnforcer) UpdatePolicy(oldPolicy []string, newPolicy []string) (bool, error) {
+	return e.mutate(func() (bool, error) {
+		return e.Enforcer.UpdatePolicy(oldPolicy, newPolicy)
+	})
+}
+
+func (e *CachedEnforcer) AddGroupingPolicy(params ...interface{}) (bool, error) {
+	return e.mutate(func() (bool, error) {
+		return e.Enforcer.AddGroupingPolicy(params...)
+	})
+}
+
+func (e *CachedEnforcer) RemoveGroupingPolicy(params ...interface{}) (bool, error) {
+	return e.mutate(func() (bool, error) {
+		return e.Enforcer.RemoveGroupingPolicy(params...)
+	})
+}
+
+func (e *CachedEnforcer) RemoveFilteredGroupingPolicy(fieldIndex int, fieldValues ...string) (bool, error) {
+	return e.mutate(func() (bool, error) {
+		return e.Enforcer.RemoveFilteredGroupingPolicy(fieldIndex, fieldValues...)
+	})
 }
 
 func (e *CachedEnforcer) SetExpireTime(expireTime time.Duration) {
 	e.expireTime = expireTime
 }
 
-// SetCache replaces the decision cache. A cache that is not safe for concurrent use is only accessed under a lock.
+// SetCache replaces the decision cache. A cache that is not safe for concurrent use is only accessed under an exclusive lock.
 func (e *CachedEnforcer) SetCache(c cache.Cache) {
-	e.cache = c
+	e.barrier.Lock()
+	defer e.barrier.Unlock()
+	e.cache = newGenerationCache(c).withGeneration(e.cache.currentGeneration())
 	e.concurrentCache = isConcurrentCache(c)
 }
 
@@ -175,9 +241,9 @@ func (e *CachedEnforcer) getKey(params ...interface{}) (string, bool) {
 
 // InvalidateCache deletes all the existing cached decisions.
 func (e *CachedEnforcer) InvalidateCache() error {
-	e.locker.Lock()
-	defer e.locker.Unlock()
-	return e.cache.Clear()
+	e.barrier.Lock()
+	defer e.barrier.Unlock()
+	return e.cache.clear()
 }
 
 type cacheKeyPart struct {
@@ -226,43 +292,11 @@ func decimalLen(n int) int {
 
 // ClearPolicy clears all policy.
 func (e *CachedEnforcer) ClearPolicy() {
-	if atomic.LoadInt32(&e.enableCache) != 0 {
-		if err := e.cache.Clear(); err != nil {
-			// Logger has been removed - error is ignored
-			return
-		}
-	}
+	e.barrier.Lock()
+	defer e.barrier.Unlock()
 	e.Enforcer.ClearPolicy()
-}
-
-// syncCacheVersion drops all cached decisions when the policy has changed since they were cached.
-func (e *CachedEnforcer) syncCacheVersion(version uint64) error {
-	if version <= atomic.LoadUint64(&e.cacheVersion) {
-		return nil
+	if err := e.invalidateCache(); err != nil {
+		// Logger has been removed - error is ignored
+		return
 	}
-
-	e.locker.Lock()
-	defer e.locker.Unlock()
-	if version <= e.cacheVersion {
-		return nil
-	}
-	if err := e.cache.Clear(); err != nil {
-		return err
-	}
-	atomic.StoreUint64(&e.cacheVersion, version)
-	return nil
-}
-
-func (e *CachedEnforcer) setCachedResult(version uint64, key string, res bool, extra ...interface{}) error {
-	if e.concurrentCache {
-		e.locker.RLock()
-		defer e.locker.RUnlock()
-	} else {
-		e.locker.Lock()
-		defer e.locker.Unlock()
-	}
-	if version != e.cacheVersion {
-		return nil
-	}
-	return e.cache.Set(key, res, extra...)
 }

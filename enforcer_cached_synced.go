@@ -27,13 +27,12 @@ import (
 
 // SyncedCachedEnforcer wraps Enforcer and provides decision sync cache.
 type SyncedCachedEnforcer struct {
-	cacheVersion uint64
-
 	*SyncedEnforcer
 	expireTime  time.Duration
-	cache       cache.Cache
+	cache       *generationCache
 	enableCache int32
-	locker      *sync.RWMutex
+	// locker guards expireTime and cache replacement.
+	locker sync.RWMutex
 }
 
 // NewSyncedCachedEnforcer creates a sync cached enforcer via file or DB.
@@ -46,9 +45,8 @@ func NewSyncedCachedEnforcer(params ...interface{}) (*SyncedCachedEnforcer, erro
 	}
 
 	e.enableCache = 1
-	e.cache, _ = cache.NewConcurrentCache(cache.DefaultConcurrentCacheSize)
-	e.locker = new(sync.RWMutex)
-	e.cacheVersion = e.getPolicyVersion()
+	innerCache, _ := cache.NewConcurrentCache(cache.DefaultConcurrentCacheSize)
+	e.cache = newGenerationCache(innerCache)
 	return e, nil
 }
 
@@ -73,65 +71,114 @@ func (e *SyncedCachedEnforcer) Enforce(rvals ...interface{}) (bool, error) {
 		return e.SyncedEnforcer.Enforce(rvals...)
 	}
 
-	version := e.getPolicyVersion()
-	if err := e.syncCacheVersion(version); err != nil {
-		return false, err
-	}
+	// The read lock spans the whole decision, so a mutation cannot advance the
+	// cache generation mid-flight. Enforcer.Enforce does not take e.m, avoiding
+	// a re-entrant read lock.
+	e.m.RLock()
+	defer e.m.RUnlock()
 
-	if res, err := e.getCachedResult(key); err == nil {
+	snapshot := e.cache.currentGeneration()
+	if res, err := e.cache.getForGeneration(snapshot, key); err == nil {
 		return res, nil
 	} else if err != cache.ErrNoSuchKey {
 		return res, err
 	}
 
-	res, err := e.SyncedEnforcer.Enforce(rvals...)
+	res, err := e.Enforcer.Enforce(rvals...)
 	if err != nil {
 		return false, err
 	}
+	if err := e.cache.set(snapshot, key, res, e.expireTime); err != nil {
+		return res, err
+	}
+	return res, nil
+}
 
-	err = e.setCachedResult(version, key, res, e.expireTime)
-	return res, err
+// invalidateCacheIfEnabled advances the cache generation. The caller must hold
+// the write lock so the invalidation is atomic relative to Enforce.
+func (e *SyncedCachedEnforcer) invalidateCacheIfEnabled() error {
+	if atomic.LoadInt32(&e.enableCache) == 0 {
+		return nil
+	}
+	return e.cache.clear()
+}
+
+// mutate runs a policy or role-link change and, after it has finished, advances
+// the cache generation so every decision from the previous state is discarded.
+func (e *SyncedCachedEnforcer) mutate(fn func() (bool, error)) (bool, error) {
+	e.m.Lock()
+	defer e.m.Unlock()
+	affected, err := fn()
+	if err != nil {
+		return affected, err
+	}
+	if err := e.invalidateCacheIfEnabled(); err != nil {
+		return affected, err
+	}
+	return affected, nil
 }
 
 func (e *SyncedCachedEnforcer) LoadPolicy() error {
-	if atomic.LoadInt32(&e.enableCache) != 0 {
-		if err := e.cache.Clear(); err != nil {
-			return err
-		}
+	e.m.Lock()
+	defer e.m.Unlock()
+	if err := e.Enforcer.LoadPolicy(); err != nil {
+		return err
 	}
-	return e.SyncedEnforcer.LoadPolicy()
+	return e.invalidateCacheIfEnabled()
 }
 
 func (e *SyncedCachedEnforcer) AddPolicy(params ...interface{}) (bool, error) {
-	if ok, err := e.checkOneAndRemoveCache(params...); !ok {
-		return ok, err
-	}
-	return e.SyncedEnforcer.AddPolicy(params...)
+	return e.mutate(func() (bool, error) {
+		return e.Enforcer.AddPolicy(params...)
+	})
 }
 
 func (e *SyncedCachedEnforcer) AddPolicies(rules [][]string) (bool, error) {
-	if ok, err := e.checkManyAndRemoveCache(rules); !ok {
-		return ok, err
-	}
-	return e.SyncedEnforcer.AddPolicies(rules)
+	return e.mutate(func() (bool, error) {
+		return e.Enforcer.AddPolicies(rules)
+	})
 }
 
 func (e *SyncedCachedEnforcer) RemovePolicy(params ...interface{}) (bool, error) {
-	if ok, err := e.checkOneAndRemoveCache(params...); !ok {
-		return ok, err
-	}
-	return e.SyncedEnforcer.RemovePolicy(params...)
+	return e.mutate(func() (bool, error) {
+		return e.Enforcer.RemovePolicy(params...)
+	})
 }
 
 func (e *SyncedCachedEnforcer) RemovePolicies(rules [][]string) (bool, error) {
-	if ok, err := e.checkManyAndRemoveCache(rules); !ok {
-		return ok, err
-	}
-	return e.SyncedEnforcer.RemovePolicies(rules)
+	return e.mutate(func() (bool, error) {
+		return e.Enforcer.RemovePolicies(rules)
+	})
 }
 
-func (e *SyncedCachedEnforcer) getCachedResult(key string) (res bool, err error) {
-	return e.cache.Get(key)
+func (e *SyncedCachedEnforcer) RemoveFilteredPolicy(fieldIndex int, fieldValues ...string) (bool, error) {
+	return e.mutate(func() (bool, error) {
+		return e.Enforcer.RemoveFilteredPolicy(fieldIndex, fieldValues...)
+	})
+}
+
+func (e *SyncedCachedEnforcer) UpdatePolicy(oldPolicy []string, newPolicy []string) (bool, error) {
+	return e.mutate(func() (bool, error) {
+		return e.Enforcer.UpdatePolicy(oldPolicy, newPolicy)
+	})
+}
+
+func (e *SyncedCachedEnforcer) AddGroupingPolicy(params ...interface{}) (bool, error) {
+	return e.mutate(func() (bool, error) {
+		return e.Enforcer.AddGroupingPolicy(params...)
+	})
+}
+
+func (e *SyncedCachedEnforcer) RemoveGroupingPolicy(params ...interface{}) (bool, error) {
+	return e.mutate(func() (bool, error) {
+		return e.Enforcer.RemoveGroupingPolicy(params...)
+	})
+}
+
+func (e *SyncedCachedEnforcer) RemoveFilteredGroupingPolicy(fieldIndex int, fieldValues ...string) (bool, error) {
+	return e.mutate(func() (bool, error) {
+		return e.Enforcer.RemoveFilteredGroupingPolicy(fieldIndex, fieldValues...)
+	})
 }
 
 func (e *SyncedCachedEnforcer) SetExpireTime(expireTime time.Duration) {
@@ -144,7 +191,7 @@ func (e *SyncedCachedEnforcer) SetExpireTime(expireTime time.Duration) {
 func (e *SyncedCachedEnforcer) SetCache(c cache.Cache) {
 	e.locker.Lock()
 	defer e.locker.Unlock()
-	e.cache = c
+	e.cache = newGenerationCache(c).withGeneration(e.cache.currentGeneration())
 }
 
 func (e *SyncedCachedEnforcer) getKey(params ...interface{}) (string, bool) {
@@ -153,62 +200,5 @@ func (e *SyncedCachedEnforcer) getKey(params ...interface{}) (string, bool) {
 
 // InvalidateCache deletes all the existing cached decisions.
 func (e *SyncedCachedEnforcer) InvalidateCache() error {
-	return e.cache.Clear()
-}
-
-func (e *SyncedCachedEnforcer) checkOneAndRemoveCache(params ...interface{}) (bool, error) {
-	if atomic.LoadInt32(&e.enableCache) != 0 {
-		key, ok := e.getKey(params...)
-		if ok {
-			if err := e.cache.Delete(key); err != nil && err != cache.ErrNoSuchKey {
-				return false, err
-			}
-		}
-	}
-	return true, nil
-}
-
-func (e *SyncedCachedEnforcer) checkManyAndRemoveCache(rules [][]string) (bool, error) {
-	if len(rules) != 0 {
-		if atomic.LoadInt32(&e.enableCache) != 0 {
-			for _, rule := range rules {
-				irule := make([]interface{}, len(rule))
-				for i, param := range rule {
-					irule[i] = param
-				}
-				key, _ := e.getKey(irule...)
-				if err := e.cache.Delete(key); err != nil && err != cache.ErrNoSuchKey {
-					return false, err
-				}
-			}
-		}
-	}
-	return true, nil
-}
-
-// syncCacheVersion drops all cached decisions when the policy has changed since they were cached.
-func (e *SyncedCachedEnforcer) syncCacheVersion(version uint64) error {
-	if version <= atomic.LoadUint64(&e.cacheVersion) {
-		return nil
-	}
-
-	e.locker.Lock()
-	defer e.locker.Unlock()
-	if version <= e.cacheVersion {
-		return nil
-	}
-	if err := e.cache.Clear(); err != nil {
-		return err
-	}
-	atomic.StoreUint64(&e.cacheVersion, version)
-	return nil
-}
-
-func (e *SyncedCachedEnforcer) setCachedResult(version uint64, key string, res bool, extra ...interface{}) error {
-	e.locker.RLock()
-	defer e.locker.RUnlock()
-	if version != e.cacheVersion {
-		return nil
-	}
-	return e.cache.Set(key, res, extra...)
+	return e.cache.clear()
 }
