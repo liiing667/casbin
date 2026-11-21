@@ -20,6 +20,7 @@ package casbin
 import (
 	"container/list"
 	"errors"
+	"reflect"
 	"sync"
 
 	"github.com/casbin/casbin/v3/model"
@@ -31,27 +32,42 @@ import (
 // so it must be safe for concurrent use.
 type EnforcerFactory func(key string, filter interface{}) (*SyncedEnforcer, error)
 
-// EnforcerPool caches enforcers by key and bounds the cache with an LRU.
-// It is intended for applications that would otherwise create a filtered
-// enforcer for every request, for example one enforcer per tenant.
+// EnforcerPool caches enforcers by tenant key and filter and bounds the cache
+// with an LRU. It is intended for applications that would otherwise create a
+// filtered enforcer for every request, for example one enforcer per tenant.
 //
-// The key must uniquely identify the filter: a cache hit returns the cached
-// enforcer without calling the factory, even if a different filter is passed.
+// A cached enforcer is returned only when both the key and the filter match
+// the ones used to build it. Passing a different filter for the same key
+// builds a new enforcer and replaces the previous entry, so a tenant switch
+// can never return an enforcer that still holds another tenant's policy.
 // Call Invalidate after a policy change that was not made through the cached
 // enforcer, and call InvalidateAll from a watcher callback to drop enforcers
 // built from a stale policy.
 type EnforcerPool struct {
-	mu         sync.Mutex
-	factory    EnforcerFactory
-	maxSize    int
-	generation uint64
-	enforcers  map[string]*enforcerPoolEntry
-	lru        *list.List
+	mu        sync.Mutex
+	factory   EnforcerFactory
+	maxSize   int
+	nextID    uint64
+	enforcers map[uint64]*enforcerPoolEntry
+	loading   map[uint64]*enforcerLoad
+	lru       *list.List
 }
 
 type enforcerPoolEntry struct {
+	id       uint64
+	key      string
+	filter   interface{}
 	enforcer *SyncedEnforcer
 	elem     *list.Element
+}
+
+type enforcerLoad struct {
+	done     chan struct{}
+	key      string
+	filter   interface{}
+	stale    bool
+	enforcer *SyncedEnforcer
+	err      error
 }
 
 var (
@@ -66,7 +82,8 @@ func NewEnforcerPool(factory EnforcerFactory, maxSize int) *EnforcerPool {
 	return &EnforcerPool{
 		factory:   factory,
 		maxSize:   maxSize,
-		enforcers: make(map[string]*enforcerPoolEntry),
+		enforcers: make(map[uint64]*enforcerPoolEntry),
+		loading:   make(map[uint64]*enforcerLoad),
 		lru:       list.New(),
 	}
 }
@@ -100,65 +117,115 @@ func NewFilteredEnforcerPool(modelPath string, newAdapter func() persist.Filtere
 	}, maxSize)
 }
 
-// Get returns the cached enforcer for key, calling the factory on a cache
-// miss. filter is passed to the factory unchanged.
+// Get returns the enforcer cached for key and filter. A cached enforcer is
+// reused only when its filter is deeply equal to filter; otherwise the factory
+// is called and the new enforcer replaces the entry that used the old filter.
+// filter is passed to the factory unchanged. Concurrent calls with the same
+// key and filter share one factory invocation.
 func (p *EnforcerPool) Get(key string, filter interface{}) (*SyncedEnforcer, error) {
 	if p.factory == nil {
 		return nil, errNilEnforcerFactory
 	}
 
-	for {
-		p.mu.Lock()
-		p.initLocked()
-		if entry, ok := p.enforcers[key]; ok {
-			p.lru.MoveToFront(entry.elem)
-			e := entry.enforcer
-			p.mu.Unlock()
-			return e, nil
-		}
-		generation := p.generation
-		p.mu.Unlock()
-
-		e, err := p.factory(key, filter)
-		if err != nil {
-			return nil, err
-		}
-		if e == nil {
-			return nil, errNilEnforcer
-		}
-
-		p.mu.Lock()
-		// The policy changed while the factory was loading, so the enforcer
-		// may have been built from stale data. Build it again.
-		if generation != p.generation {
-			p.mu.Unlock()
-			continue
-		}
-		if entry, ok := p.enforcers[key]; ok {
-			p.lru.MoveToFront(entry.elem)
-			e = entry.enforcer
-			p.mu.Unlock()
-			return e, nil
-		}
-
-		entry := &enforcerPoolEntry{enforcer: e}
-		entry.elem = p.lru.PushFront(key)
-		p.enforcers[key] = entry
-		p.evictLocked()
+	p.mu.Lock()
+	p.initLocked()
+	if entry := p.findEntryLocked(key, filter); entry != nil {
+		p.lru.MoveToFront(entry.elem)
+		e := entry.enforcer
 		p.mu.Unlock()
 		return e, nil
 	}
+	if load := p.findLoadLocked(key, filter); load != nil {
+		p.mu.Unlock()
+		return p.waitForLoad(key, filter, load)
+	}
+
+	load := &enforcerLoad{
+		done:   make(chan struct{}),
+		key:    key,
+		filter: filter,
+	}
+	loadID := p.nextID
+	p.nextID++
+	p.loading[loadID] = load
+	p.mu.Unlock()
+
+	enforcer, err := p.factory(key, filter)
+	if err == nil && enforcer == nil {
+		err = errNilEnforcer
+	}
+
+	p.mu.Lock()
+	delete(p.loading, loadID)
+	load.enforcer = enforcer
+	load.err = err
+	close(load.done)
+	if err != nil {
+		p.mu.Unlock()
+		return nil, err
+	}
+
+	// The pool was invalidated while the factory was loading, so this
+	// enforcer may have been built from a stale policy. Drop it and retry.
+	if load.stale {
+		p.mu.Unlock()
+		return p.Get(key, filter)
+	}
+
+	// A concurrent retry may have inserted an entry for the exact same key
+	// and filter while this goroutine was outside the lock. Keep one entry.
+	if entry := p.findEntryLocked(key, filter); entry != nil {
+		p.lru.MoveToFront(entry.elem)
+		enforcer = entry.enforcer
+		p.mu.Unlock()
+		return enforcer, nil
+	}
+
+	// A different filter for the same key means a legitimate tenant switch:
+	// drop the enforcer that held the old filter before inserting the new one
+	// so the two tenants never share an instance.
+	p.removeKeyLocked(key)
+
+	entryID := p.nextID
+	p.nextID++
+	entry := &enforcerPoolEntry{
+		id:       entryID,
+		key:      key,
+		filter:   filter,
+		enforcer: enforcer,
+	}
+	entry.elem = p.lru.PushFront(entry)
+	p.enforcers[entryID] = entry
+	p.evictLocked()
+	p.mu.Unlock()
+	return enforcer, nil
 }
 
-// Invalidate drops the enforcer cached for key.
+func (p *EnforcerPool) waitForLoad(key string, filter interface{}, load *enforcerLoad) (*SyncedEnforcer, error) {
+	<-load.done
+	if load.err != nil {
+		return nil, load.err
+	}
+	// The entry was invalidated while the factory was running. The loading
+	// goroutine discards its result and retries, so resolve through the pool
+	// again instead of handing back an enforcer that no longer belongs to it.
+	if load.stale {
+		return p.Get(key, filter)
+	}
+	return load.enforcer, nil
+}
+
+// Invalidate drops every enforcer cached for key, no matter which filter it
+// was built with. Loads in progress for key are discarded when they finish.
 func (p *EnforcerPool) Invalidate(key string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.initLocked()
-	p.generation++
-	if entry, ok := p.enforcers[key]; ok {
-		delete(p.enforcers, key)
-		p.lru.Remove(entry.elem)
+	p.removeKeyLocked(key)
+	for _, load := range p.loading {
+		if load.key == key {
+			load.stale = true
+		}
 	}
 }
 
@@ -167,9 +234,11 @@ func (p *EnforcerPool) InvalidateAll() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.initLocked()
-	p.generation++
-	p.enforcers = make(map[string]*enforcerPoolEntry)
+	p.enforcers = make(map[uint64]*enforcerPoolEntry)
 	p.lru.Init()
+	for _, load := range p.loading {
+		load.stale = true
+	}
 }
 
 // OnUpdate invalidates every cached enforcer. Its signature matches the
@@ -182,15 +251,51 @@ func (p *EnforcerPool) OnUpdate(string) {
 func (p *EnforcerPool) Len() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.initLocked()
 	return len(p.enforcers)
 }
 
 func (p *EnforcerPool) initLocked() {
 	if p.enforcers == nil {
-		p.enforcers = make(map[string]*enforcerPoolEntry)
+		p.enforcers = make(map[uint64]*enforcerPoolEntry)
+	}
+	if p.loading == nil {
+		p.loading = make(map[uint64]*enforcerLoad)
 	}
 	if p.lru == nil {
 		p.lru = list.New()
+	}
+}
+
+// findEntryLocked returns the entry built with key and a deeply equal filter,
+// or nil when no such entry is cached.
+func (p *EnforcerPool) findEntryLocked(key string, filter interface{}) *enforcerPoolEntry {
+	for _, entry := range p.enforcers {
+		if entry.key == key && reflect.DeepEqual(entry.filter, filter) {
+			return entry
+		}
+	}
+	return nil
+}
+
+// findLoadLocked returns an in-flight load for key with a deeply equal filter.
+func (p *EnforcerPool) findLoadLocked(key string, filter interface{}) *enforcerLoad {
+	for _, load := range p.loading {
+		if load.key == key && reflect.DeepEqual(load.filter, filter) {
+			return load
+		}
+	}
+	return nil
+}
+
+// removeKeyLocked drops every entry whose tenant key matches key, regardless
+// of the filter the entry was built with.
+func (p *EnforcerPool) removeKeyLocked(key string) {
+	for id, entry := range p.enforcers {
+		if entry.key == key {
+			delete(p.enforcers, id)
+			p.lru.Remove(entry.elem)
+		}
 	}
 }
 
@@ -203,7 +308,8 @@ func (p *EnforcerPool) evictLocked() {
 		if back == nil {
 			return
 		}
-		delete(p.enforcers, back.Value.(string))
+		entry := back.Value.(*enforcerPoolEntry)
+		delete(p.enforcers, entry.id)
 		p.lru.Remove(back)
 	}
 }

@@ -232,7 +232,7 @@ https://casbin.apache.org/docs/production-deployment
 
 ## Enforcer pooling
 
-If your application creates a filtered enforcer for every request, for example one enforcer per tenant, use `EnforcerPool` to reuse one enforcer per key and bound the cache with an LRU:
+If your application creates a filtered enforcer for every request, for example one enforcer per tenant, use `EnforcerPool` to reuse one enforcer per tenant and bound the cache with an LRU:
 
 ```go
 // newAdapter creates a new filtered adapter for each enforcer.
@@ -252,6 +252,8 @@ watcher.SetUpdateCallback(pool.OnUpdate)
 ```
 
 `NewFilteredEnforcerPool` calls `newAdapter` once per enforcer, so filtered adapters that keep state are not shared. The filter passed to `Get` must be the type your adapter expects; use `NewEnforcerPool` with your own factory for other filter types. A `maxSize` of zero or less means no limit.
+
+A pooled enforcer is identified by both the key and the filter. `Get` returns a cached enforcer only when the filter is deeply equal to the one used to build it; if the same key is used with a different filter, for example when a tenant's filter changes, the previous enforcer is replaced by a freshly built one, so two tenants can never share an instance. Concurrent calls with the same key and filter share a single factory invocation, and LRU eviction only removes the least recently used entries without crossing tenant boundaries.
 
 ## Role manager
 
