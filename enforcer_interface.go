@@ -18,6 +18,8 @@
 package casbin
 
 import (
+	"context"
+
 	"github.com/casbin/casbin/v3/effector"
 	"github.com/casbin/casbin/v3/model"
 	"github.com/casbin/casbin/v3/persist"
@@ -64,6 +66,8 @@ type IEnforcer interface {
 	EnforceExWithMatcher(matcher string, rvals ...interface{}) (bool, []string, error)
 	BatchEnforce(requests [][]interface{}) ([]bool, error)
 	BatchEnforceWithMatcher(matcher string, requests [][]interface{}) ([]bool, error)
+	BatchEnforceEx(ctx context.Context, requests [][]interface{}) ([]BatchEnforceResult, error)
+	BatchEnforceExWithMatcher(ctx context.Context, matcher string, requests [][]interface{}) ([]BatchEnforceResult, error)
 	Explain(rvals ...interface{}) (string, error)
 
 	/* RBAC API */

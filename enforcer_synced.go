@@ -18,6 +18,7 @@
 package casbin
 
 import (
+	"context"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -230,6 +231,21 @@ func (e *SyncedEnforcer) BatchEnforceWithMatcher(matcher string, requests [][]in
 	e.m.RLock()
 	defer e.m.RUnlock()
 	return e.Enforcer.BatchEnforceWithMatcher(matcher, requests)
+}
+
+// BatchEnforceEx enforce in batches and keep an independent result per request.
+func (e *SyncedEnforcer) BatchEnforceEx(ctx context.Context, requests [][]interface{}) ([]BatchEnforceResult, error) {
+	e.m.RLock()
+	defer e.m.RUnlock()
+	return e.Enforcer.BatchEnforceEx(ctx, requests)
+}
+
+// BatchEnforceExWithMatcher enforce with matcher in batches and keep an
+// independent result per request.
+func (e *SyncedEnforcer) BatchEnforceExWithMatcher(ctx context.Context, matcher string, requests [][]interface{}) ([]BatchEnforceResult, error) {
+	e.m.RLock()
+	defer e.m.RUnlock()
+	return e.Enforcer.BatchEnforceExWithMatcher(ctx, matcher, requests)
 }
 
 // GetAllSubjects gets the list of subjects that show up in the current policy.
