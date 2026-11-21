@@ -87,21 +87,29 @@ func (e *DefaultEffector) MergeEffects(expr string, effects []Effect, matches []
 			}
 		}
 	case constant.PriorityEffect, constant.SubjectPriorityEffect:
-		// reverse merge, short-circuit may be earlier
-		for i := len(effects) - 1; i >= 0; i-- {
-			if matches[i] == 0 {
+		// Policies are already ordered from the highest to the lowest
+		// priority. A definite effect is never returned while more policies
+		// are pending: every match has to be aggregated, otherwise the first
+		// or the last hit alone would decide the result instead of the
+		// highest-priority hit.
+		if policyIndex < policyLength-1 {
+			break
+		}
+
+		// Once all rules are inspected, take the effect of the first
+		// (highest-priority) matched definite rule.
+		for i, eft := range effects {
+			if matches[i] == 0 || eft == Indeterminate {
 				continue
 			}
 
-			if effects[i] != Indeterminate {
-				if effects[i] == Allow {
-					result = Allow
-				} else {
-					result = Deny
-				}
-				explainIndex = i
-				break
+			if eft == Allow {
+				result = Allow
+			} else {
+				result = Deny
 			}
+			explainIndex = i
+			break
 		}
 	default:
 		return Deny, -1, errors.New("unsupported effect")

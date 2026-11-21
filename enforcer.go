@@ -778,6 +778,41 @@ func (e *Enforcer) effectiveEffectExpr(pType string, pTokens map[string]int, eff
 	return constant.AllowOverrideEffect
 }
 
+// shortCircuitOnDefiniteEffect reports whether evaluation can stop as soon as
+// the effector returns a definite effect. Priority-based effects aggregate
+// every matched rule and only decide at the last rule, so the enforcer loop
+// must keep evaluating until then.
+func shortCircuitOnDefiniteEffect(effectExpr string) bool {
+	return effectExpr != constant.PriorityEffect && effectExpr != constant.SubjectPriorityEffect
+}
+
+// resolveSamePriorityConflict enforces the conservative default for
+// priority-based effects. When two matched definite rules share the same
+// explicit priority and disagree, no rule outranks the other, so allowing
+// would depend on rule insertion order; the request is denied instead and no
+// rule is reported as the explanation. The enforcer keeps the effector
+// decision when the policy has no explicit priority token or when there is no
+// same-priority disagreement.
+func (e *Enforcer) resolveSamePriorityConflict(pType string, pTokens map[string]int, policyEffects []effector.Effect, matcherResults []float64, effect effector.Effect, explainIndex int) (effector.Effect, int) {
+	priorityIndex, hasPriority := pTokens[pType+"_priority"]
+	if !hasPriority || explainIndex == -1 {
+		return effect, explainIndex
+	}
+
+	policies := e.model["p"][pType].Policy
+	winningPriority := policies[explainIndex][priorityIndex]
+	winningEffect := policyEffects[explainIndex]
+	for i, pvals := range policies {
+		if i == explainIndex || matcherResults[i] == 0 || policyEffects[i] == effector.Indeterminate {
+			continue
+		}
+		if pvals[priorityIndex] == winningPriority && policyEffects[i] != winningEffect {
+			return effector.Indeterminate, -1
+		}
+	}
+	return effect, explainIndex
+}
+
 func (e *Enforcer) getPolicyVersion() uint64 {
 	return atomic.LoadUint64(&e.policyVersion)
 }
@@ -935,7 +970,7 @@ func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interfac
 				if err != nil {
 					return false, err
 				}
-				if effect != effector.Indeterminate {
+				if effect != effector.Indeterminate && shortCircuitOnDefiniteEffect(effectExpr) {
 					break
 				}
 				continue
@@ -970,7 +1005,7 @@ func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interfac
 			if err != nil {
 				return false, err
 			}
-			if effect != effector.Indeterminate {
+			if effect != effector.Indeterminate && shortCircuitOnDefiniteEffect(effectExpr) {
 				break
 			}
 		}
@@ -1000,6 +1035,10 @@ func (e *Enforcer) enforce(matcher string, explains *[]string, rvals ...interfac
 		if err != nil {
 			return false, err
 		}
+	}
+
+	if effectExpr == constant.PriorityEffect || effectExpr == constant.SubjectPriorityEffect {
+		effect, explainIndex = e.resolveSamePriorityConflict(pType, pTokens, policyEffects, matcherResults, effect, explainIndex)
 	}
 
 	if explains != nil {
