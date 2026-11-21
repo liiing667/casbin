@@ -566,7 +566,7 @@ func TestSubjectPriorityInFilter(t *testing.T) {
 
 	adapter := fileadapter.NewFilteredAdapter("examples/subject_priority_policy_with_domain.csv")
 	_ = e.InitWithAdapter("examples/subject_priority_model_with_domain.conf", adapter)
-	if err := e.loadFilteredPolicy(&fileadapter.Filter{
+	if err := e.LoadFilteredPolicy(&fileadapter.Filter{
 		P: []string{"", "", "domain1"},
 	}); err != nil {
 		t.Errorf("unexpected error in LoadFilteredPolicy: %v", err)

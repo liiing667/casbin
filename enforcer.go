@@ -500,9 +500,15 @@ func (e *Enforcer) rebuildConditionalRoleLinks(newModel model.Model) error {
 	return nil
 }
 
-func (e *Enforcer) loadFilteredPolicy(filter interface{}) error {
-	e.invalidateMatcherMap()
-
+// loadFilteredPolicy loads a filtered policy from the adapter.
+//
+// The adapter never mutates the live model directly. Rules are loaded into a
+// staging copy and the live model is only replaced once every step (adapter,
+// sorting and role links) succeeds. An adapter failure therefore keeps the
+// previous tenant view fully intact instead of exposing a partially populated
+// one. When clearPolicy is false the staging copy starts from the current view,
+// which preserves the append semantics of incremental filtered loads.
+func (e *Enforcer) loadFilteredPolicy(filter interface{}, clearPolicy bool) error {
 	var filteredAdapter persist.FilteredAdapter
 
 	// Attempt to cast the Adapter as a FilteredAdapter
@@ -512,39 +518,54 @@ func (e *Enforcer) loadFilteredPolicy(filter interface{}) error {
 	default:
 		return errors.New("filtered policies are not supported by this adapter")
 	}
-	if err := filteredAdapter.LoadFilteredPolicy(e.model, filter); err != nil && err.Error() != "invalid file path, file path cannot be empty" {
+
+	newModel := e.model.Copy()
+	if clearPolicy {
+		newModel.ClearPolicy()
+	}
+
+	if err := filteredAdapter.LoadFilteredPolicy(newModel, filter); err != nil && err.Error() != "invalid file path, file path cannot be empty" {
 		return err
 	}
 
-	if err := e.model.SortPoliciesBySubjectHierarchy(); err != nil {
+	if err := newModel.SortPoliciesBySubjectHierarchy(); err != nil {
 		return err
 	}
 
-	if err := e.model.SortPoliciesByPriority(); err != nil {
+	if err := newModel.SortPoliciesByPriority(); err != nil {
 		return err
 	}
 
+	return e.applyFilteredModel(newModel)
+}
+
+func (e *Enforcer) applyFilteredModel(newModel model.Model) error {
 	e.initRmMap()
-	e.model.PrintPolicy()
 	if e.autoBuildRoleLinks {
-		err := e.BuildRoleLinks()
-		if err != nil {
+		if err := e.rebuildRoleLinks(newModel); err != nil {
+			return err
+		}
+
+		if err := e.rebuildConditionalRoleLinks(newModel); err != nil {
 			return err
 		}
 	}
+
+	e.model = newModel
+	e.resetPolicyCaches()
+	e.invalidateMatcherMap()
+	e.model.PrintPolicy()
 	return nil
 }
 
 // LoadFilteredPolicy reloads a filtered policy from file/database.
 func (e *Enforcer) LoadFilteredPolicy(filter interface{}) error {
-	e.model.ClearPolicy()
-
-	return e.loadFilteredPolicy(filter)
+	return e.loadFilteredPolicy(filter, true)
 }
 
 // LoadIncrementalFilteredPolicy append a filtered policy from file/database.
 func (e *Enforcer) LoadIncrementalFilteredPolicy(filter interface{}) error {
-	return e.loadFilteredPolicy(filter)
+	return e.loadFilteredPolicy(filter, false)
 }
 
 // IsFiltered returns true if the loaded policy has been filtered.

@@ -89,18 +89,15 @@ func (e *ContextEnforcer) loadPolicyFromAdapterCtx(ctx context.Context, baseMode
 
 // LoadFilteredPolicyCtx loads all policy rules from the storage with context and filter.
 func (e *Enforcer) LoadFilteredPolicyCtx(ctx context.Context, filter interface{}) error {
-	e.model.ClearPolicy()
-	return e.loadFilteredPolicyCtx(ctx, filter)
+	return e.loadFilteredPolicyCtx(ctx, filter, true)
 }
 
 // LoadIncrementalFilteredPolicyCtx append a filtered policy from file/database with context.
 func (e *Enforcer) LoadIncrementalFilteredPolicyCtx(ctx context.Context, filter interface{}) error {
-	return e.loadFilteredPolicyCtx(ctx, filter)
+	return e.loadFilteredPolicyCtx(ctx, filter, false)
 }
 
-func (e *Enforcer) loadFilteredPolicyCtx(ctx context.Context, filter interface{}) error {
-	e.invalidateMatcherMap()
-
+func (e *Enforcer) loadFilteredPolicyCtx(ctx context.Context, filter interface{}, clearPolicy bool) error {
 	var filteredAdapter persist.ContextFilteredAdapter
 
 	// Attempt to cast the Adapter as a FilteredAdapter
@@ -110,27 +107,27 @@ func (e *Enforcer) loadFilteredPolicyCtx(ctx context.Context, filter interface{}
 	default:
 		return errors.New("filtered policies are not supported by this adapter")
 	}
-	if err := filteredAdapter.LoadFilteredPolicyCtx(ctx, e.model, filter); err != nil && err.Error() != "invalid file path, file path cannot be empty" {
+
+	// Build the new tenant view on a staging copy so an upstream failure or a
+	// cancelled context cannot leave the live model in a half-populated state.
+	newModel := e.model.Copy()
+	if clearPolicy {
+		newModel.ClearPolicy()
+	}
+
+	if err := filteredAdapter.LoadFilteredPolicyCtx(ctx, newModel, filter); err != nil && err.Error() != "invalid file path, file path cannot be empty" {
 		return err
 	}
 
-	if err := e.model.SortPoliciesBySubjectHierarchy(); err != nil {
+	if err := newModel.SortPoliciesBySubjectHierarchy(); err != nil {
 		return err
 	}
 
-	if err := e.model.SortPoliciesByPriority(); err != nil {
+	if err := newModel.SortPoliciesByPriority(); err != nil {
 		return err
 	}
 
-	e.initRmMap()
-	e.model.PrintPolicy()
-	if e.autoBuildRoleLinks {
-		err := e.BuildRoleLinks()
-		if err != nil {
-			return err
-		}
-	}
-	return nil
+	return e.applyFilteredModel(newModel)
 }
 
 // IsFilteredCtx returns true if the loaded policy has been filtered with context.
